@@ -17,6 +17,7 @@ from playwright.sync_api import sync_playwright
 CLAW_CLOUD_URL = "https://eu-central-1.run.claw.cloud"
 SIGNIN_URL = f"{CLAW_CLOUD_URL}/signin"
 DEVICE_VERIFY_WAIT = 30
+TWO_FACTOR_WAIT = int(os.environ.get("TWO_FACTOR_WAIT", "120"))  # 默认等 120 秒
 
 
 class Telegram:
@@ -208,6 +209,55 @@ class AutoLogin:
         self.tg.send("❌ <b>设备验证超时</b>")
         return False
     
+    def wait_two_factor_mobile(self, page):
+        """等待 GitHub Mobile 两步验证批准，并把数字截图提前发到电报"""
+        self.log(f"需要两步验证（GitHub Mobile），等待 {TWO_FACTOR_WAIT} 秒...", "WARN")
+        
+        # 先截图并立刻发出去（让你看到数字）
+        shot = self.shot(page, "两步验证_mobile")
+        self.tg.send(f"""⚠️ <b>需要两步验证（GitHub Mobile）</b>
+
+请打开手机 GitHub App 批准本次登录（会让你确认一个数字）。
+等待时间：{TWO_FACTOR_WAIT} 秒""")
+        if shot:
+            self.tg.photo(shot, "两步验证页面（数字在图里）")
+        
+        # 不要频繁 reload，避免把流程刷回登录页
+        for i in range(TWO_FACTOR_WAIT):
+            time.sleep(1)
+            
+            url = page.url
+            
+            # 如果离开 two-factor 流程页面，认为通过
+            if "github.com/sessions/two-factor/" not in url:
+                self.log("两步验证通过！", "SUCCESS")
+                self.tg.send("✅ <b>两步验证通过</b>")
+                return True
+            
+            # 如果被刷回登录页，说明这次流程断了（不要硬等）
+            if "github.com/login" in url:
+                self.log("两步验证后回到了登录页，需重新登录", "ERROR")
+                return False
+            
+            # 每 10 秒打印一次，并补发一次截图（防止你没看到数字）
+            if i % 10 == 0 and i != 0:
+                self.log(f"  等待... ({i}/{TWO_FACTOR_WAIT}秒)")
+                shot = self.shot(page, f"两步验证_{i}s")
+                if shot:
+                    self.tg.photo(shot, f"两步验证页面（第{i}秒）")
+            
+            # 只在 30 秒、60 秒... 做一次轻刷新（可选，频率很低）
+            if i % 30 == 0 and i != 0:
+                try:
+                    page.reload(timeout=30000)
+                    page.wait_for_load_state('domcontentloaded', timeout=30000)
+                except:
+                    pass
+        
+        self.log("两步验证超时", "ERROR")
+        self.tg.send("❌ <b>两步验证超时</b>")
+        return False
+    
     def login_github(self, page, context):
         """登录 GitHub"""
         self.log("登录 GitHub...", "STEP")
@@ -245,9 +295,24 @@ class AutoLogin:
         
         # 2FA
         if 'two-factor' in page.url:
-            self.log("需要两步验证！", "ERROR")
-            self.tg.send("❌ <b>需要两步验证</b>")
-            return False
+            self.log("需要两步验证！", "WARN")
+            self.shot(page, "两步验证")
+            
+            # GitHub Mobile：等待你在手机上批准
+            if 'two-factor/mobile' in page.url:
+                if not self.wait_two_factor_mobile(page):
+                    return False
+                # 通过后等页面稳定
+                try:
+                    page.wait_for_load_state('networkidle', timeout=30000)
+                    time.sleep(2)
+                except:
+                    pass
+            
+            else:
+                # 其它两步验证方式（比如 app/otp 输入页），本脚本没自动填码就先失败
+                self.tg.send("❌ <b>需要两步验证（非 Mobile）</b>")
+                return False
         
         # 错误
         try:
